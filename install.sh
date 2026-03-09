@@ -312,18 +312,29 @@ fi
 
 log "Processing firewall rules..."
 
+ufw_allow_rule() {
+    local rule="$1"
+    local rule_comment="$2"
+
+    if ufw allow "$rule" comment "$rule_comment" >> "$LOG_FILE" 2>&1; then
+        return 0
+    fi
+
+    ufw allow "$rule" >> "$LOG_FILE" 2>&1
+}
+
 # Check if UFW is already enabled
 if ufw status | grep -q "Status: active"; then
     warn "UFW already active, existing rules will be preserved"
     # Check if our ports are already allowed
     if ! ufw status | grep -q "22/tcp"; then
-        ufw allow 22/tcp comment 'SSH' >> "$LOG_FILE" 2>&1
+        ufw_allow_rule "22/tcp" "SSH"
     else
         log "SSH port (22) already allowed"
     fi
     
     if ! ufw status | grep -q "$WG_PORT/udp"; then
-        ufw allow $WG_PORT/udp comment 'WireGuard Port' >> "$LOG_FILE" 2>&1
+        ufw_allow_rule "$WG_PORT/udp" "WireGuard Port"
     else
         log "WireGuard port ($WG_PORT) already allowed"
     fi
@@ -331,8 +342,8 @@ else
     # Fresh UFW setup
     ufw default deny incoming >> "$LOG_FILE" 2>&1
     ufw default allow outgoing >> "$LOG_FILE" 2>&1
-    ufw allow 22/tcp comment 'SSH' >> "$LOG_FILE" 2>&1
-    ufw allow $WG_PORT/udp comment 'WireGuard Port' >> "$LOG_FILE" 2>&1
+    ufw_allow_rule "22/tcp" "SSH"
+    ufw_allow_rule "$WG_PORT/udp" "WireGuard Port"
 fi
 
 # Modify UFW default forward policy
@@ -346,15 +357,20 @@ if grep -q "\*nat" "$UFW_BEFORE"; then
     warn "Detected existing NAT rules!"
     echo -e "1) PRESERVE existing rules (insert WireGuard rule in between)"
     echo -e "2) DELETE existing NAT table (write only WireGuard rule)"
-    read -p "Selection (1/2): " NAT_CHOICE
+    if [[ -t 0 ]]; then
+        read -p "Selection (1/2) [1]: " NAT_CHOICE
+    fi
+    NAT_CHOICE=${NAT_CHOICE:-1}
     
     if [[ "$NAT_CHOICE" == "1" ]]; then
         # If rule doesn't exist, insert into *nat table
         if ! grep -q "10.8.0.0/24" "$UFW_BEFORE"; then
              # Check if *nat table exists
             if grep -q "^\*nat" "$UFW_BEFORE"; then
-                 # Insert after *nat line
-                 sed -i "/^\*nat/a $WG_NAT_RULE" "$UFW_BEFORE"
+                if ! grep -q "^:POSTROUTING " "$UFW_BEFORE"; then
+                    sed -i "/^\*nat/a :POSTROUTING ACCEPT [0:0]" "$UFW_BEFORE"
+                fi
+                sed -i "/^\*nat/,/^COMMIT/ { /^COMMIT/i $WG_NAT_RULE }" "$UFW_BEFORE"
             else
                  # Create *nat table if it doesn't exist (unlikely if choice 1 was offered but safe fallback)
                  sed -i "1i*nat\n:POSTROUTING ACCEPT [0:0]\n$WG_NAT_RULE\nCOMMIT\n" "$UFW_BEFORE"
