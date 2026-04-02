@@ -183,8 +183,15 @@ while [[ $RETRY_COUNT -lt $MAX_RETRIES ]]; do
     fi
 done
 
+# Detect OS and set resolvconf package accordingly
+# Ubuntu 24.04+ uses resolvconf, Debian uses openresolv
+RESOLV_PKG="resolvconf"
+if grep -qi "debian" /etc/os-release 2>/dev/null; then
+    RESOLV_PKG="openresolv"
+fi
+
 # Install packages with dependency check
-PACKAGES="procps iproute2 iptables curl wget ufw fail2ban qrencode openresolv wireguard wireguard-tools unattended-upgrades"
+PACKAGES="procps iproute2 iptables curl wget ufw fail2ban qrencode $RESOLV_PKG wireguard wireguard-tools unattended-upgrades"
 
 log "Installing required packages: $PACKAGES"
 
@@ -214,6 +221,11 @@ for pkg in wireguard wireguard-tools ufw; do
         warn "$pkg package may be missing or not properly installed."
     fi
 done
+
+# Verify wg command is available
+if ! command -v wg &>/dev/null; then
+    error "WireGuard (wg) command not found after installation. Cannot continue."
+fi
 
 # --- 4. SECURE SSH CONFIGURATION ---
 log "Configuring SSH security..."
@@ -312,38 +324,32 @@ fi
 
 log "Processing firewall rules..."
 
+# Simplified ufw_allow_rule - no comment parameter to avoid compatibility issues
 ufw_allow_rule() {
     local rule="$1"
-    local rule_comment="$2"
-
-    if ufw allow "$rule" comment "$rule_comment" >> "$LOG_FILE" 2>&1; then
-        return 0
-    fi
-
-    ufw allow "$rule" >> "$LOG_FILE" 2>&1
+    ufw allow "$rule" >> "$LOG_FILE" 2>&1 || true
 }
 
 # Check if UFW is already enabled
 if ufw status | grep -q "Status: active"; then
     warn "UFW already active, existing rules will be preserved"
-    # Check if our ports are already allowed
     if ! ufw status | grep -q "22/tcp"; then
-        ufw_allow_rule "22/tcp" "SSH"
+        ufw_allow_rule "22/tcp"
     else
         log "SSH port (22) already allowed"
     fi
     
     if ! ufw status | grep -q "$WG_PORT/udp"; then
-        ufw_allow_rule "$WG_PORT/udp" "WireGuard Port"
+        ufw_allow_rule "$WG_PORT/udp"
     else
         log "WireGuard port ($WG_PORT) already allowed"
     fi
 else
     # Fresh UFW setup
-    ufw default deny incoming >> "$LOG_FILE" 2>&1
-    ufw default allow outgoing >> "$LOG_FILE" 2>&1
-    ufw_allow_rule "22/tcp" "SSH"
-    ufw_allow_rule "$WG_PORT/udp" "WireGuard Port"
+    ufw default deny incoming >> "$LOG_FILE" 2>&1 || true
+    ufw default allow outgoing >> "$LOG_FILE" 2>&1 || true
+    ufw_allow_rule "22/tcp"
+    ufw_allow_rule "$WG_PORT/udp"
 fi
 
 # Modify UFW default forward policy
@@ -363,17 +369,14 @@ if grep -q "\*nat" "$UFW_BEFORE"; then
     NAT_CHOICE=${NAT_CHOICE:-1}
     
     if [[ "$NAT_CHOICE" == "1" ]]; then
-        # If rule doesn't exist, insert into *nat table
         if ! grep -q "10.8.0.0/24" "$UFW_BEFORE"; then
-             # Check if *nat table exists
             if grep -q "^\*nat" "$UFW_BEFORE"; then
                 if ! grep -q "^:POSTROUTING " "$UFW_BEFORE"; then
                     sed -i "/^\*nat/a :POSTROUTING ACCEPT [0:0]" "$UFW_BEFORE"
                 fi
                 sed -i "/^\*nat/,/^COMMIT/ { /^COMMIT/i $WG_NAT_RULE }" "$UFW_BEFORE"
             else
-                 # Create *nat table if it doesn't exist (unlikely if choice 1 was offered but safe fallback)
-                 sed -i "1i*nat\n:POSTROUTING ACCEPT [0:0]\n$WG_NAT_RULE\nCOMMIT\n" "$UFW_BEFORE"
+                sed -i "1i*nat\n:POSTROUTING ACCEPT [0:0]\n$WG_NAT_RULE\nCOMMIT\n" "$UFW_BEFORE"
             fi
         fi
     else
@@ -438,7 +441,7 @@ fi
 if systemctl is-enabled --quiet fail2ban 2>/dev/null; then
     log "fail2ban already enabled"
 else
-    systemctl enable fail2ban >> "$LOG_FILE" 2>&1
+    systemctl enable fail2ban >> "$LOG_FILE" 2>&1 || warn "fail2ban could not be enabled, may not be installed."
 fi
 
 # Restart fail2ban
@@ -446,7 +449,6 @@ systemctl restart fail2ban >> "$LOG_FILE" 2>&1 || warn "fail2ban service could n
 
 # Enable WireGuard service with validation
 if [[ -f "$WG_DIR/wg0.conf" ]]; then
-    # Validate WireGuard configuration before enabling
     if wg-quick strip wg0 > /dev/null 2>&1; then
         if systemctl is-enabled --quiet wg-quick@wg0 2>/dev/null; then
             log "wg-quick@wg0 already enabled"
@@ -454,7 +456,6 @@ if [[ -f "$WG_DIR/wg0.conf" ]]; then
             systemctl enable wg-quick@wg0 >> "$LOG_FILE" 2>&1
         fi
         
-        # Try to start the service now to verify configuration
         log "Starting WireGuard service..."
         if systemctl start wg-quick@wg0 2>> "$LOG_FILE"; then
             log "WireGuard service started successfully"
