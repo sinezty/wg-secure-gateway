@@ -107,6 +107,11 @@ if [[ "$CURRENT_USER" == "root" || -z "$CURRENT_USER" || ( "$EUID" -eq 0 && -z "
     IS_ROOT_USER=true
 fi
 
+# If script is piped (curl | bash), redirect stdin from /dev/tty for interactive input
+if [[ ! -t 0 ]]; then
+    exec bash "$0" < /dev/tty
+fi
+
 read -p "WireGuard Port [41194]: " INPUT_WG
 WG_PORT=${INPUT_WG:-41194}
 
@@ -231,20 +236,21 @@ fi
 log "Configuring SSH security..."
 mkdir -p /etc/ssh/sshd_config.d/
 
-if [[ "$DISABLE_ROOT" == "y" || "$DISABLE_ROOT" == "Y" ]]; then
-    PERMIT_ROOT="no"
-    log "Root login will be disabled."
-    success "You're logged in as '$CURRENT_USER' - you'll still be able to connect with this user."
-else
+if [[ "$IS_ROOT_USER" == "true" ]]; then
     PERMIT_ROOT="yes"
-    if [[ "$IS_ROOT_USER" == "true" ]]; then
-        warn "Root login remains enabled (you are logged in as root)."
+    warn "Logged in as root — SSH hardening skipped to prevent lockout."
+    warn "Root login remains enabled."
+else
+    if [[ "$DISABLE_ROOT" == "y" || "$DISABLE_ROOT" == "Y" ]]; then
+        PERMIT_ROOT="no"
+        log "Root login will be disabled."
+        success "You're logged in as '$CURRENT_USER' - you'll still be able to connect with this user."
     else
+        PERMIT_ROOT="yes"
         warn "Root login remains enabled (not recommended for security)!"
     fi
-fi
 
-cat > /etc/ssh/sshd_config.d/99-custom.conf <<EOF
+    cat > /etc/ssh/sshd_config.d/99-custom.conf <<EOF
 PermitRootLogin $PERMIT_ROOT
 PasswordAuthentication yes
 PubkeyAuthentication yes
@@ -253,8 +259,19 @@ ClientAliveInterval 300
 ClientAliveCountMax 2
 EOF
 
-if ! sshd -t; then
-    error "SSH configuration error detected! Stopping operation."
+    if ! sshd -t; then
+        error "SSH configuration error detected! Stopping operation."
+    fi
+
+    # Restart SSH to apply hardening
+    if systemctl list-units --type=service | grep -q "sshd.service"; then
+        systemctl restart sshd >> "$LOG_FILE" 2>&1 || warn "Could not restart SSH service."
+    elif systemctl list-units --type=service | grep -q "ssh.service"; then
+        systemctl restart ssh >> "$LOG_FILE" 2>&1 || warn "Could not restart SSH service."
+    else
+        warn "SSH service not found, skipping restart."
+    fi
+    success "SSH hardening applied."
 fi
 
 # --- 5. NETWORK DETECTION AND KEY GENERATION ---
@@ -522,10 +539,6 @@ echo ""
 
 # Disable error trap before final output
 trap - ERR
-
-# Restart SSH to apply hardening (no port change, safe)
-systemctl restart sshd >> "$LOG_FILE" 2>&1 || warn "Could not restart SSH service."
-success "SSH hardening applied (no reboot needed)."
 
 read -p "Reboot system now? (y/n) [n]: " REBOOT_FINAL
 REBOOT_FINAL=${REBOOT_FINAL:-n}
