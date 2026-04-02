@@ -108,14 +108,14 @@ fi
 
 # Helper: read from /dev/tty if stdin is not a terminal (e.g. curl | bash)
 ask() {
-    local prompt="$1" var="$2" default="$3"
+    local prompt="$1" var="$2" default="$3" _input
     if [[ -t 0 ]]; then
-        read -p "$prompt" "$var"
+        read -p "$prompt" _input
     else
-        read -p "$prompt" "$var" < /dev/tty
+        read -p "$prompt" _input < /dev/tty
     fi
-    # Apply default if empty
-    [[ -z "${!var}" ]] && printf -v "$var" '%s' "$default"
+    [[ -z "$_input" ]] && _input="$default"
+    eval "$var=\"\$_input\""
 }
 
 ask "WireGuard Port [41194]: " INPUT_WG "41194"
