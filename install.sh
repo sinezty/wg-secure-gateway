@@ -83,8 +83,7 @@ if [[ -d /etc/wireguard ]]; then
 fi
 if [[ -n "$EXISTING_WG_CONFIG" ]]; then
     warn "Existing WireGuard configuration found: $EXISTING_WG_CONFIG"
-    read -p "Continuing will overwrite these configurations. Continue? (y/n) [n]: " WG_OVERWRITE
-    WG_OVERWRITE=${WG_OVERWRITE:-n}
+    ask "Continuing will overwrite these configurations. Continue? (y/n) [n]: " WG_OVERWRITE "n"
     if [[ "$WG_OVERWRITE" != "y" ]]; then
         error "User cancelled."
     fi
@@ -107,12 +106,20 @@ if [[ "$CURRENT_USER" == "root" || -z "$CURRENT_USER" || ( "$EUID" -eq 0 && -z "
     IS_ROOT_USER=true
 fi
 
-# If script is piped (curl | bash), redirect stdin from /dev/tty for interactive input
-if [[ ! -t 0 ]]; then
-    exec < /dev/tty
-fi
+# Helper: read from /dev/tty if stdin is not a terminal (e.g. curl | bash)
+ask() {
+    local prompt="$1" var="$2" default="$3"
+    if [[ -t 0 ]]; then
+        read -p "$prompt" "$var"
+    else
+        read -p "$prompt" "$var" < /dev/tty
+    fi
+    # Apply default if empty
+    [[ -z "${!var}" ]] && printf -v "$var" '%s' "$default"
+}
 
-read -p "WireGuard Port [41194]: " INPUT_WG
+ask "WireGuard Port [41194]: " INPUT_WG "41194"
+WG_PORT="$INPUT_WG"
 WG_PORT=${INPUT_WG:-41194}
 
 # DNS Selection
@@ -124,16 +131,15 @@ echo -e "  1) Cloudflare  (1.1.1.1, 1.0.0.1)"
 echo -e "  2) Google      (8.8.8.8, 8.8.4.4)"
 echo -e "  3) AdGuard     (94.140.14.14, 94.140.15.15)"
 echo -e "  4) Custom"
-read -p "Select DNS provider [1]: " DNS_CHOICE
-DNS_CHOICE=${DNS_CHOICE:-1}
+ask "Select DNS provider [1]: " DNS_CHOICE "1"
 
 case "$DNS_CHOICE" in
     1) CLIENT_DNS="1.1.1.1, 1.0.0.1" ;;
     2) CLIENT_DNS="8.8.8.8, 8.8.4.4" ;;
     3) CLIENT_DNS="94.140.14.14, 94.140.15.15" ;;
     4)
-        read -p "Primary DNS: " CUSTOM_DNS1
-        read -p "Secondary DNS: " CUSTOM_DNS2
+        ask "Primary DNS: " CUSTOM_DNS1 ""
+        ask "Secondary DNS: " CUSTOM_DNS2 ""
         if [[ -z "$CUSTOM_DNS1" ]]; then
             warn "No DNS entered, using Cloudflare as default."
             CLIENT_DNS="1.1.1.1, 1.0.0.1"
@@ -148,11 +154,9 @@ esac
 log "DNS configured: $CLIENT_DNS"
 echo ""
 
-read -p "Enable automatic security updates? (y/n) [y]: " AUTO_UP
-AUTO_UP=${AUTO_UP:-y}
+ask "Enable automatic security updates? (y/n) [y]: " AUTO_UP "y"
 
-read -p "Reset all existing Firewall (UFW) rules? (y/n) [n]: " RESET_UFW
-RESET_UFW=${RESET_UFW:-n}
+ask "Reset all existing Firewall (UFW) rules? (y/n) [n]: " RESET_UFW "n"
 
 # Ask about Root Login - but prevent if logged in as root
 if [[ "$IS_ROOT_USER" == "true" ]]; then
@@ -160,10 +164,9 @@ if [[ "$IS_ROOT_USER" == "true" ]]; then
     echo -e "${YELLOW}Disabling root login would lock you out of the system.${NC}"
     echo -e "${YELLOW}Root SSH login will remain ENABLED for your safety.${NC}"
     DISABLE_ROOT=n
-    read -p "Press Enter to continue..."
+    read -p "Press Enter to continue..." < /dev/tty
 else
-    read -p "Disable SSH Root Login? (Recommended for security) (y/n) [y]: " DISABLE_ROOT
-    DISABLE_ROOT=${DISABLE_ROOT:-y}
+    ask "Disable SSH Root Login? (Recommended for security) (y/n) [y]: " DISABLE_ROOT "y"
 fi
 
 # --- 3. SYSTEM PREPARATION AND PACKAGE INSTALLATION ---
@@ -304,7 +307,7 @@ done
 
 if [[ "$SERVER_PUBLIC_IP" == "IP_NOT_FOUND" ]]; then
     warn "Could not obtain external IP address. Setup will continue but needs to be entered manually."
-    read -p "Please enter your server's external IP address: " MANUAL_IP
+    ask "Please enter your server's external IP address: " MANUAL_IP ""
     if [[ -n "$MANUAL_IP" ]]; then
         SERVER_PUBLIC_IP="$MANUAL_IP"
         log "Manual IP address set: $SERVER_PUBLIC_IP"
@@ -380,10 +383,7 @@ if grep -q "\*nat" "$UFW_BEFORE"; then
     warn "Detected existing NAT rules!"
     echo -e "1) PRESERVE existing rules (insert WireGuard rule in between)"
     echo -e "2) DELETE existing NAT table (write only WireGuard rule)"
-    if [[ -t 0 ]]; then
-        read -p "Selection (1/2) [1]: " NAT_CHOICE
-    fi
-    NAT_CHOICE=${NAT_CHOICE:-1}
+        ask "Selection (1/2) [1]: " NAT_CHOICE "1"
     
     if [[ "$NAT_CHOICE" == "1" ]]; then
         if ! grep -q "10.8.0.0/24" "$UFW_BEFORE"; then
@@ -540,8 +540,7 @@ echo ""
 # Disable error trap before final output
 trap - ERR
 
-read -p "Reboot system now? (y/n) [n]: " REBOOT_FINAL
-REBOOT_FINAL=${REBOOT_FINAL:-n}
+ask "Reboot system now? (y/n) [n]: " REBOOT_FINAL "n"
 
 if [[ "$REBOOT_FINAL" == "y" || "$REBOOT_FINAL" == "Y" ]]; then
     log "Rebooting system..."
