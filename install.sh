@@ -109,7 +109,7 @@ fi
 
 # If script is piped (curl | bash), redirect stdin from /dev/tty for interactive input
 if [[ ! -t 0 ]]; then
-    exec bash "$0" < /dev/tty
+    exec < /dev/tty
 fi
 
 read -p "WireGuard Port [41194]: " INPUT_WG
