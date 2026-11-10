@@ -55,6 +55,7 @@ check_prerequisites() {
     fi
 
     # Source OS information
+    # shellcheck disable=SC1091
     . /etc/os-release
     OS_ID="${ID:-unknown}"
     OS_VERSION="${VERSION_ID:-unknown}"
@@ -62,7 +63,7 @@ check_prerequisites() {
 
     case "$OS_ID" in
         ubuntu|debian|raspbian|dietpi|armbian|pop|linuxmint)
-            log "Detected supported OS: $OS_NAME"
+            log "Detected supported OS: $OS_NAME ($OS_VERSION)"
             ;;
         *)
             warn "Your operating system ($OS_NAME) is not officially tested."
@@ -152,9 +153,11 @@ install_packages() {
     local required_pkgs="wireguard wireguard-tools iptables iproute2 procps curl wget ufw fail2ban python3-systemd qrencode unattended-upgrades"
 
     log "Installing required packages: $required_pkgs"
+    # shellcheck disable=SC2086
     apt-get install -y --no-install-recommends $required_pkgs >> "$LOG_FILE" 2>&1 || {
         warn "Standard install had issues, attempting --fix-broken..."
         apt-get install -f -y >> "$LOG_FILE" 2>&1 || true
+        # shellcheck disable=SC2086
         apt-get install -y --no-install-recommends $required_pkgs >> "$LOG_FILE" 2>&1 || error "Failed to install required packages."
     }
 
@@ -194,7 +197,9 @@ configure_ssh() {
     fi
 
     # Backup existing custom config if present
-    [[ -f /etc/ssh/sshd_config.d/99-custom.conf ]] && cp /etc/ssh/sshd_config.d/99-custom.conf /etc/ssh/sshd_config.d/99-custom.conf.bak 2>/dev/null || true
+    if [[ -f /etc/ssh/sshd_config.d/99-custom.conf ]]; then
+        cp /etc/ssh/sshd_config.d/99-custom.conf /etc/ssh/sshd_config.d/99-custom.conf.bak 2>/dev/null || true
+    fi
 
     # Ensure main sshd_config includes sshd_config.d/*.conf
     if [[ -f /etc/ssh/sshd_config ]] && ! grep -qiE '^\s*Include\s+/etc/ssh/sshd_config.d/\*\.conf' /etc/ssh/sshd_config; then
@@ -374,8 +379,8 @@ EOF
 Address = 10.8.0.1/24
 ListenPort = $WG_PORT
 PrivateKey = $server_priv
-PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o $NET_INTERFACE -j MASQUERADE
-PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -D POSTROUTING -s 10.8.0.0/24 -o $NET_INTERFACE -j MASQUERADE
+PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o $NET_INTERFACE -j MASQUERADE; iptables -t mangle -A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o $NET_INTERFACE -j TCPMSS --clamp-mss-to-pmtu
+PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -D POSTROUTING -s 10.8.0.0/24 -o $NET_INTERFACE -j MASQUERADE; iptables -t mangle -D POSTROUTING -p tcp --tcp-flags SYN,RST SYN -o $NET_INTERFACE -j TCPMSS --clamp-mss-to-pmtu
 
 EOF
     chmod 600 "$WG_DIR/wg0.conf"
@@ -410,6 +415,7 @@ add_client() {
 
     # Read server parameters
     if [[ -f "$WG_DIR/params" ]]; then
+        # shellcheck disable=SC1091
         . "$WG_DIR/params"
     else
         error "Server params file not found ($WG_DIR/params)."
