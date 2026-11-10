@@ -2,50 +2,13 @@
 
 # =============================================================================
 # WireGuard Gateway & SSH Security Hardening Suite
-# Support: Debian 11/12/13, Ubuntu 20.04/22.04/24.04+
+# Support: Debian 11/12/13, Ubuntu 20.04/22.04/24.04+, Raspbian, DietPi, Armbian
 # Purpose: Seamless installation on minimal systems, NAT protection and high security.
 # =============================================================================
 
-
-# Rollback function to restore system state in case of failure
-rollback() {
-    local step=$1
-    warn "Rollback starting... Step: $step"
-    
-    case "$step" in
-        "services")
-            systemctl stop wg-quick@wg0 2>/dev/null || true
-            systemctl disable wg-quick@wg0 2>/dev/null || true
-            ;;
-        "firewall")
-            # Restore original SSH config if we backed up
-            if [[ -f "/etc/ssh/sshd_config.d/99-custom.conf.bak" ]]; then
-                mv "/etc/ssh/sshd_config.d/99-custom.conf.bak" "/etc/ssh/sshd_config.d/99-custom.conf" 2>/dev/null || true
-                systemctl reload ssh 2>/dev/null || true
-            fi
-            ;;
-        *)
-            warn "Undefined rollback step: $step"
-            ;;
-    esac
-}
-
-# Error handling function to log errors and perform cleanup
-handle_error() {
-    local exit_code=$?
-    echo -e "${RED}[ERROR]${NC} Error occurred: Line $1, Exit code: $exit_code" | tee -a "$LOG_FILE"
-    
-    # Attempt cleanup if needed
-    if [[ -n "$BACKUP_CREATED" ]]; then
-        echo -e "${YELLOW}[WARNING]${NC} Backup file found, restore recommended: $BACKUP_CREATED" | tee -a "$LOG_FILE"
-    fi
-    
-    trap - ERR
-    exit $exit_code
-}
-
-# Set trap to catch errors
-trap 'handle_error $LINENO' ERR
+# PATH correction (for minimal systems)
+export PATH=$PATH:/sbin:/usr/sbin:/usr/local/sbin:/usr/local/bin:/usr/bin:/bin
+export DEBIAN_FRONTEND=noninteractive
 
 # --- COLORS AND LOGGING ---
 RED='\033[0;31m'
@@ -53,499 +16,641 @@ GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
+BOLD='\033[1m'
 NC='\033[0m'
 LOG_FILE="/var/log/wg_setup.log"
+WG_DIR="/etc/wireguard"
+WG_CLIENTS_DIR="$WG_DIR/clients"
 
 log() { echo -e "${BLUE}[$(date +%T)]${NC} $1" | tee -a "$LOG_FILE"; }
 success() { echo -e "${GREEN}[OK]${NC} $1" | tee -a "$LOG_FILE"; }
 warn() { echo -e "${YELLOW}[WARNING]${NC} $1" | tee -a "$LOG_FILE"; }
-error() { echo -e "${RED}[ERROR]${NC} $1" | tee -a "$LOG_FILE"; trap - ERR; exit 1; }
-
-# --- 1. PREREQUISITE CHECKS ---
-echo -e "${CYAN}===================================================="
-echo -e "   WIREGUARD GATEWAY & SSH SECURITY INSTALLER"
-echo -e "====================================================${NC}"
-
-if [[ $EUID -ne 0 ]]; then
-   error "This script must be run with root privileges!"
-fi
-
-# PATH correction (for minimal systems)
-export PATH=$PATH:/sbin:/usr/sbin:/usr/local/sbin:/usr/local/bin:/usr/bin:/bin
-
-# --- SYSTEM STATE CHECK ---
-log "Checking system state..."
-
-# Check if existing WireGuard configuration exists
-EXISTING_WG_CONFIG=""
-if [[ -d /etc/wireguard ]]; then
-    EXISTING_WG_CONFIG="$(find /etc/wireguard -maxdepth 1 -name '*.conf' -print -quit 2>/dev/null)"
-fi
-if [[ -n "$EXISTING_WG_CONFIG" ]]; then
-    warn "Existing WireGuard configuration found: $EXISTING_WG_CONFIG"
-    ask "Continuing will overwrite these configurations. Continue? (y/n) [n]: " WG_OVERWRITE "n"
-    if [[ "$WG_OVERWRITE" != "y" ]]; then
-        error "User cancelled."
-    fi
-fi
-
-# Is WireGuard service running?
-if systemctl is-active --quiet wg-quick@wg0; then
-    warn "Found running WireGuard service. Stopping..."
-    systemctl stop wg-quick@wg0 >> "$LOG_FILE" 2>&1 || true
-fi
-
-# --- 2. CONFIGURATION SETUP ---
-echo -e "${YELLOW}Please configure installation settings (Press Enter for defaults):${NC}"
-echo ""
-
-# Get current user info early
-CURRENT_USER="${SUDO_USER:-$USER}"
-IS_ROOT_USER=false
-if [[ "$CURRENT_USER" == "root" || -z "$CURRENT_USER" || ( "$EUID" -eq 0 && -z "$SUDO_USER" ) ]]; then
-    IS_ROOT_USER=true
-fi
+error() { echo -e "${RED}[ERROR]${NC} $1" | tee -a "$LOG_FILE"; exit 1; }
 
 # Helper: read from /dev/tty if stdin is not a terminal (e.g. curl | bash)
 ask() {
     local prompt="$1" var="$2" default="$3" _input
+    if [[ -n "${!var}" ]]; then
+        return
+    fi
     if [[ -t 0 ]]; then
-        read -p "$prompt" _input
+        read -r -p "$prompt" _input
+    elif [[ -e /dev/tty ]] && read -r -p "$prompt" _input < /dev/tty 2>/dev/null; then
+        :
     else
-        read -p "$prompt" _input < /dev/tty
+        _input="$default"
     fi
     [[ -z "$_input" ]] && _input="$default"
     eval "$var=\"\$_input\""
 }
 
-ask "WireGuard Port [41194]: " INPUT_WG "41194"
-WG_PORT="$INPUT_WG"
-WG_PORT=${INPUT_WG:-41194}
+# --- 1. PREREQUISITE AND PERMISSION CHECKS ---
+check_prerequisites() {
+    if [[ $EUID -ne 0 ]]; then
+        error "This script must be run with root privileges! (e.g. sudo bash $0)"
+    fi
 
-# DNS Selection
-echo ""
-echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${YELLOW}DNS Configuration${NC}"
-echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "  1) Cloudflare  (1.1.1.1, 1.0.0.1)"
-echo -e "  2) Google      (8.8.8.8, 8.8.4.4)"
-echo -e "  3) AdGuard     (94.140.14.14, 94.140.15.15)"
-echo -e "  4) Custom"
-ask "Select DNS provider [1]: " DNS_CHOICE "1"
+    if [[ ! -f /etc/os-release ]]; then
+        error "Cannot detect operating system: /etc/os-release not found."
+    fi
 
-case "$DNS_CHOICE" in
-    1) CLIENT_DNS="1.1.1.1, 1.0.0.1" ;;
-    2) CLIENT_DNS="8.8.8.8, 8.8.4.4" ;;
-    3) CLIENT_DNS="94.140.14.14, 94.140.15.15" ;;
-    4)
-        ask "Primary DNS: " CUSTOM_DNS1 ""
-        ask "Secondary DNS: " CUSTOM_DNS2 ""
-        if [[ -z "$CUSTOM_DNS1" ]]; then
-            warn "No DNS entered, using Cloudflare as default."
-            CLIENT_DNS="1.1.1.1, 1.0.0.1"
-        elif [[ -z "$CUSTOM_DNS2" ]]; then
-            CLIENT_DNS="$CUSTOM_DNS1"
-        else
-            CLIENT_DNS="$CUSTOM_DNS1, $CUSTOM_DNS2"
-        fi
-        ;;
-    *) CLIENT_DNS="1.1.1.1, 1.0.0.1" ;;
-esac
-log "DNS configured: $CLIENT_DNS"
-echo ""
+    # Source OS information
+    . /etc/os-release
+    OS_ID="${ID:-unknown}"
+    OS_VERSION="${VERSION_ID:-unknown}"
+    OS_NAME="${PRETTY_NAME:-$OS_ID}"
 
-ask "Enable automatic security updates? (y/n) [y]: " AUTO_UP "y"
+    case "$OS_ID" in
+        ubuntu|debian|raspbian|dietpi|armbian|pop|linuxmint)
+            log "Detected supported OS: $OS_NAME"
+            ;;
+        *)
+            warn "Your operating system ($OS_NAME) is not officially tested."
+            ask "Do you want to continue anyway? (y/n) [n]: " FORCE_RUN "n"
+            if [[ "$FORCE_RUN" != "y" && "$FORCE_RUN" != "Y" ]]; then
+                error "Installation cancelled."
+            fi
+            ;;
+    esac
+}
 
-ask "Reset all existing Firewall (UFW) rules? (y/n) [n]: " RESET_UFW "n"
-
-# Ask about Root Login - but prevent if logged in as root
-if [[ "$IS_ROOT_USER" == "true" ]]; then
-    echo -e "${RED}⚠️  WARNING: You are logged in as ROOT user!${NC}"
-    echo -e "${YELLOW}Disabling root login would lock you out of the system.${NC}"
-    echo -e "${YELLOW}Root SSH login will remain ENABLED for your safety.${NC}"
-    DISABLE_ROOT=n
-    read -p "Press Enter to continue..." < /dev/tty
-else
-    ask "Disable SSH Root Login? (Recommended for security) (y/n) [y]: " DISABLE_ROOT "y"
-fi
-
-# --- 3. SYSTEM PREPARATION AND PACKAGE INSTALLATION ---
-log "Preparing system packages..."
-
-# Update with retry mechanism
-RETRY_COUNT=0
-MAX_RETRIES=3
-while [[ $RETRY_COUNT -lt $MAX_RETRIES ]]; do
-    log "Fetching package lists... (attempt: $(($RETRY_COUNT + 1))/$MAX_RETRIES)"
-    if apt-get update -y >> "$LOG_FILE" 2>&1; then
-        log "Package lists updated successfully."
-        break
+# --- HELPER: GET REAL USER & HOME DIRECTORY ---
+get_user_info() {
+    CURRENT_USER="${SUDO_USER:-$USER}"
+    if [[ -z "$CURRENT_USER" || "$CURRENT_USER" == "root" ]]; then
+        CURRENT_USER="root"
+        USER_HOME="/root"
+        IS_ROOT_USER=true
     else
-        RETRY_COUNT=$((RETRY_COUNT + 1))
-        if [[ $RETRY_COUNT -lt $MAX_RETRIES ]]; then
-            warn "Failed to fetch package lists, retrying..."
-            sleep 5
-        else
-            error "Could not update package lists. Please check your internet connection."
+        USER_HOME=$(getent passwd "$CURRENT_USER" | cut -d: -f6)
+        [[ -z "$USER_HOME" ]] && USER_HOME="/home/$CURRENT_USER"
+        IS_ROOT_USER=false
+    fi
+}
+
+# --- HELPER: DETECT NETWORK INTERFACE AND EXTERNAL IP ---
+detect_network() {
+    log "Detecting primary network interface..."
+    NET_INTERFACE=$(ip -4 route ls | grep default | awk '{print $5}' | head -n1)
+    if [[ -z "$NET_INTERFACE" ]]; then
+        NET_INTERFACE=$(ip link show | grep -v "lo:" | grep -o "^[0-9]*: [^:]*" | head -n1 | cut -d: -f2 | tr -d ' ')
+    fi
+
+    if [[ -z "$NET_INTERFACE" ]]; then
+        error "Could not detect default network interface. Please check network configuration."
+    fi
+    log "Network interface: $NET_INTERFACE"
+
+    log "Detecting server public IP..."
+    SERVER_PUBLIC_IP=""
+    for service in "https://api.ipify.org" "https://checkip.amazonaws.com" "https://icanhazip.com" "https://ifconfig.me"; do
+        TEMP_IP=$(curl -s -4 --connect-timeout 5 "$service" 2>/dev/null | tr -d '\r\n ' | grep -E '^([0-9]{1,3}\.){3}[0-9]{1,3}$')
+        if [[ -n "$TEMP_IP" ]]; then
+            SERVER_PUBLIC_IP="$TEMP_IP"
+            break
+        fi
+    done
+
+    if [[ -z "$SERVER_PUBLIC_IP" ]]; then
+        warn "Could not automatically determine public IPv4."
+        ask "Please enter your server's public IP address or domain: " SERVER_PUBLIC_IP ""
+        if [[ -z "$SERVER_PUBLIC_IP" ]]; then
+            error "Public IP or domain is required for WireGuard clients to connect."
         fi
     fi
-done
+    log "Server Public Endpoint: $SERVER_PUBLIC_IP"
+}
 
-# Detect OS and set resolvconf package accordingly
-# Ubuntu 24.04+ uses resolvconf, Debian uses openresolv
-RESOLV_PKG="resolvconf"
-if grep -qi "debian" /etc/os-release 2>/dev/null; then
-    RESOLV_PKG="openresolv"
-fi
-
-# Install packages with dependency check
-PACKAGES="procps iproute2 iptables curl wget ufw fail2ban qrencode $RESOLV_PKG wireguard wireguard-tools unattended-upgrades"
-
-log "Installing required packages: $PACKAGES"
-
-# Check if packages are already installed
-MISSING_PACKAGES=""
-for pkg in $PACKAGES; do
-    if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
-        MISSING_PACKAGES="$MISSING_PACKAGES $pkg"
+# --- HELPER: DETECT ACTIVE SSH PORT ---
+detect_ssh_port() {
+    local detected_port
+    detected_port=$(sshd -T 2>/dev/null | grep -i '^port ' | awk '{print $2}' | head -n1)
+    if [[ -z "$detected_port" && -f /etc/ssh/sshd_config ]]; then
+        detected_port=$(grep -i '^Port ' /etc/ssh/sshd_config | awk '{print $2}' | head -n1)
     fi
-done
+    SSH_PORT=${detected_port:-22}
+    log "Detected SSH port: $SSH_PORT"
+}
 
-if [[ -n "$MISSING_PACKAGES" ]]; then
-    log "Missing packages to install: $MISSING_PACKAGES"
-    if ! apt-get install -y $MISSING_PACKAGES --no-install-recommends >> "$LOG_FILE" 2>&1; then
-        warn "Some packages failed to install, retrying with --fix-missing..."
-        apt-get install -f -y --no-install-recommends >> "$LOG_FILE" 2>&1 || true
-        apt-get install -y $MISSING_PACKAGES --no-install-recommends >> "$LOG_FILE" 2>&1 || \
-            warn "Some packages could not be installed but continuing with setup..."
+# --- 2. PACKAGE INSTALLATION ---
+install_packages() {
+    log "Updating package repositories..."
+    local retry=0
+    local max_retries=3
+    while [[ $retry -lt $max_retries ]]; do
+        if apt-get update -y >> "$LOG_FILE" 2>&1; then
+            break
+        fi
+        retry=$((retry + 1))
+        warn "apt-get update failed, retrying ($retry/$max_retries)..."
+        sleep 3
+    done
+
+    # Notice: We intentionally do NOT install resolvconf/openresolv on the server.
+    # On modern Ubuntu (22.04/24.04), installing resolvconf breaks systemd-resolved (127.0.0.53).
+    # WireGuard server does not need resolvconf; only clients parsing 'DNS =' directives do.
+    local required_pkgs="wireguard wireguard-tools iptables iproute2 procps curl wget ufw fail2ban python3-systemd qrencode unattended-upgrades"
+
+    log "Installing required packages: $required_pkgs"
+    apt-get install -y --no-install-recommends $required_pkgs >> "$LOG_FILE" 2>&1 || {
+        warn "Standard install had issues, attempting --fix-broken..."
+        apt-get install -f -y >> "$LOG_FILE" 2>&1 || true
+        apt-get install -y --no-install-recommends $required_pkgs >> "$LOG_FILE" 2>&1 || error "Failed to install required packages."
+    }
+
+    if ! command -v wg &>/dev/null; then
+        error "WireGuard (wg) command not found after installation. Aborting."
     fi
-else
-    log "All required packages are already installed."
-fi
+    success "Required packages successfully installed."
+}
 
-# Verify critical packages are installed
-for pkg in wireguard wireguard-tools ufw; do
-    if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
-        warn "$pkg package may be missing or not properly installed."
-    fi
-done
+# --- 3. SSH HARDENING ---
+configure_ssh() {
+    log "Configuring SSH security hardening..."
+    detect_ssh_port
+    mkdir -p /etc/ssh/sshd_config.d/
 
-# Verify wg command is available
-if ! command -v wg &>/dev/null; then
-    error "WireGuard (wg) command not found after installation. Cannot continue."
-fi
-
-# --- 4. SECURE SSH CONFIGURATION ---
-log "Configuring SSH security..."
-mkdir -p /etc/ssh/sshd_config.d/
-
-if [[ "$IS_ROOT_USER" == "true" ]]; then
-    PERMIT_ROOT="yes"
-    warn "Logged in as root — SSH hardening skipped to prevent lockout."
-    warn "Root login remains enabled."
-else
-    if [[ "$DISABLE_ROOT" == "y" || "$DISABLE_ROOT" == "Y" ]]; then
-        PERMIT_ROOT="no"
-        log "Root login will be disabled."
-        success "You're logged in as '$CURRENT_USER' - you'll still be able to connect with this user."
+    local permit_root="yes"
+    if [[ "$IS_ROOT_USER" == "true" ]]; then
+        warn "Logged in directly as root without a secondary sudo user."
+        warn "Root login will remain ENABLED to prevent total lockout."
+        permit_root="yes"
     else
-        PERMIT_ROOT="yes"
-        warn "Root login remains enabled (not recommended for security)!"
+        ask "Disable SSH Root Login? (Recommended: you are logged in as '$CURRENT_USER') (y/n) [y]: " DISABLE_ROOT "y"
+        if [[ "$DISABLE_ROOT" == "y" || "$DISABLE_ROOT" == "Y" ]]; then
+            permit_root="no"
+            log "Root login will be disabled."
+        else
+            permit_root="yes"
+            warn "Root login will remain enabled."
+        fi
+    fi
+
+    # Determine existing PasswordAuthentication preference if present
+    local pass_auth="yes"
+    if sshd -T 2>/dev/null | grep -qi '^passwordauthentication no'; then
+        pass_auth="no"
+        log "Preserving existing SSH setting: PasswordAuthentication no (key-only)"
+    fi
+
+    # Backup existing custom config if present
+    [[ -f /etc/ssh/sshd_config.d/99-custom.conf ]] && cp /etc/ssh/sshd_config.d/99-custom.conf /etc/ssh/sshd_config.d/99-custom.conf.bak 2>/dev/null || true
+
+    # Ensure main sshd_config includes sshd_config.d/*.conf
+    if [[ -f /etc/ssh/sshd_config ]] && ! grep -qiE '^\s*Include\s+/etc/ssh/sshd_config.d/\*\.conf' /etc/ssh/sshd_config; then
+        echo -e "\nInclude /etc/ssh/sshd_config.d/*.conf" >> /etc/ssh/sshd_config
     fi
 
     cat > /etc/ssh/sshd_config.d/99-custom.conf <<EOF
-PermitRootLogin $PERMIT_ROOT
-PasswordAuthentication yes
+# WireGuard Gateway SSH Hardening
+Port $SSH_PORT
+PermitRootLogin $permit_root
+PasswordAuthentication $pass_auth
 PubkeyAuthentication yes
 MaxAuthTries 3
 ClientAliveInterval 300
 ClientAliveCountMax 2
 EOF
 
+    # Test configuration before restarting service
     if ! sshd -t; then
-        error "SSH configuration error detected! Stopping operation."
-    fi
-
-    # Restart SSH to apply hardening
-    if systemctl list-units --type=service | grep -q "sshd.service"; then
-        systemctl restart sshd >> "$LOG_FILE" 2>&1 || warn "Could not restart SSH service."
-    elif systemctl list-units --type=service | grep -q "ssh.service"; then
-        systemctl restart ssh >> "$LOG_FILE" 2>&1 || warn "Could not restart SSH service."
+        warn "SSHD syntax test failed! Reverting SSH custom config..."
+        rm -f /etc/ssh/sshd_config.d/99-custom.conf
+        [[ -f /etc/ssh/sshd_config.d/99-custom.conf.bak ]] && mv /etc/ssh/sshd_config.d/99-custom.conf.bak /etc/ssh/sshd_config.d/99-custom.conf
     else
-        warn "SSH service not found, skipping restart."
+        # Compatible with Ubuntu 24.04 (ssh.socket) and older distros (ssh.service / sshd.service)
+        if systemctl is-active --quiet ssh.socket; then
+            systemctl reload ssh.socket >> "$LOG_FILE" 2>&1 || true
+        elif systemctl list-units --type=service | grep -q "ssh.service"; then
+            systemctl reload-or-restart ssh >> "$LOG_FILE" 2>&1 || true
+        elif systemctl list-units --type=service | grep -q "sshd.service"; then
+            systemctl reload-or-restart sshd >> "$LOG_FILE" 2>&1 || true
+        fi
+        success "SSH hardening applied safely on port $SSH_PORT."
     fi
-    success "SSH hardening applied."
-fi
+}
 
-# --- 5. NETWORK DETECTION AND KEY GENERATION ---
-log "Detecting network interface and IP..."
+# --- 4. FAIL2BAN CONFIGURATION ---
+configure_fail2ban() {
+    log "Configuring Fail2ban with systemd journal backend..."
+    mkdir -p /etc/fail2ban/jail.d/
 
-# Network interface detection with fallbacks
-NET_INTERFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
-if [[ -z "$NET_INTERFACE" ]]; then
-    # Fallback to first non-loopback interface
-    NET_INTERFACE=$(ip link show | grep -v "lo:" | grep -o "^[0-9]*: [^:]*" | head -n1 | cut -d: -f2 | tr -d ' ')
-    if [[ -z "$NET_INTERFACE" ]]; then
-        error "Network interface not found. Please configure manually."
-    else
-        warn "Default network interface not found, using: $NET_INTERFACE"
-    fi
-fi
-log "Network interface determined: $NET_INTERFACE"
+    # Uses systemd backend which is fully compatible with Debian 12 (no rsyslog) and Ubuntu 24.04
+    cat > /etc/fail2ban/jail.d/ssh-hardening.local <<EOF
+[DEFAULT]
+bantime = 1h
+findtime = 10m
+maxretry = 3
 
-# Server public IP detection with multiple fallbacks
-SERVER_PUBLIC_IP="IP_NOT_FOUND"
-for service in "ifconfig.me" "ipecho.net/plain" "checkip.amazonaws.com" "ident.me" "icanhazip.com"; do
-    log "Getting external IP address: $service"
-    TEMP_IP=$(curl -s -4 --connect-timeout 10 "$service" 2>/dev/null | grep -o '[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}' | head -n1)
-    if [[ -n "$TEMP_IP" && "$TEMP_IP" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-        SERVER_PUBLIC_IP="$TEMP_IP"
-        log "External IP address obtained: $SERVER_PUBLIC_IP"
-        break
-    fi
-done
+[sshd]
+enabled = true
+port = $SSH_PORT
+backend = systemd
+EOF
 
-if [[ "$SERVER_PUBLIC_IP" == "IP_NOT_FOUND" ]]; then
-    warn "Could not obtain external IP address. Setup will continue but needs to be entered manually."
-    ask "Please enter your server's external IP address: " MANUAL_IP ""
-    if [[ -n "$MANUAL_IP" ]]; then
-        SERVER_PUBLIC_IP="$MANUAL_IP"
-        log "Manual IP address set: $SERVER_PUBLIC_IP"
-    else
-        error "Cannot continue without external IP address."
-    fi
-fi
+    systemctl enable fail2ban >> "$LOG_FILE" 2>&1 || true
+    systemctl restart fail2ban >> "$LOG_FILE" 2>&1 || warn "Could not restart fail2ban service."
+    success "Fail2ban enabled and monitoring SSH (port $SSH_PORT)."
+}
 
-# IP Forwarding
-cat > /etc/sysctl.d/99-wireguard.conf <<EOF
+# --- 5. SYSTEM KERNEL & FIREWALL CONFIGURATION ---
+configure_firewall() {
+    log "Enabling IP forwarding in kernel..."
+    cat > /etc/sysctl.d/99-wireguard.conf <<EOF
 net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1
 EOF
-/sbin/sysctl -p /etc/sysctl.d/99-wireguard.conf >> "$LOG_FILE" 2>&1 || true
+    sysctl --system >> "$LOG_FILE" 2>&1 || sysctl -p /etc/sysctl.d/99-wireguard.conf >> "$LOG_FILE" 2>&1 || true
 
-# Key Generation
-WG_DIR="/etc/wireguard"
-mkdir -p "$WG_DIR" && chmod 700 "$WG_DIR"
-SERVER_PRIV=$(wg genkey); SERVER_PUB=$(echo "$SERVER_PRIV" | wg pubkey)
-CLIENT_PRIV=$(wg genkey); CLIENT_PUB=$(echo "$CLIENT_PRIV" | wg pubkey)
-
-# --- 6. FIREWALL (UFW) AND NAT CONFIGURATION ---
-
-# Backup current UFW rules before making changes
-if [[ -f "/etc/ufw/before.rules" ]]; then
-    cp "/etc/ufw/before.rules" "/etc/ufw/before.rules.backup.$(date +%s)" 2>/dev/null || true
-    log "UFW before.rules backup created"
-fi
-
-if [[ "$RESET_UFW" == "y" ]]; then
-    warn "Resetting UFW rules..."
-    ufw --force reset >> "$LOG_FILE" 2>&1
-fi
-
-log "Processing firewall rules..."
-
-# Simplified ufw_allow_rule - no comment parameter to avoid compatibility issues
-ufw_allow_rule() {
-    local rule="$1"
-    ufw allow "$rule" >> "$LOG_FILE" 2>&1 || true
-}
-
-# Check if UFW is already enabled
-if ufw status | grep -q "Status: active"; then
-    warn "UFW already active, existing rules will be preserved"
-    if ! ufw status | grep -q "22/tcp"; then
-        ufw_allow_rule "22/tcp"
-    else
-        log "SSH port (22) already allowed"
+    log "Configuring UFW (Uncomplicated Firewall)..."
+    ask "Reset existing UFW firewall rules? (y/n) [n]: " RESET_UFW "n"
+    if [[ "$RESET_UFW" == "y" || "$RESET_UFW" == "Y" ]]; then
+        warn "Resetting UFW rules..."
+        ufw --force reset >> "$LOG_FILE" 2>&1 || true
     fi
-    
-    if ! ufw status | grep -q "$WG_PORT/udp"; then
-        ufw_allow_rule "$WG_PORT/udp"
-    else
-        log "WireGuard port ($WG_PORT) already allowed"
-    fi
-else
-    # Fresh UFW setup
+
+    # Set default policies
     ufw default deny incoming >> "$LOG_FILE" 2>&1 || true
     ufw default allow outgoing >> "$LOG_FILE" 2>&1 || true
-    ufw_allow_rule "22/tcp"
-    ufw_allow_rule "$WG_PORT/udp"
-fi
 
-# Modify UFW default forward policy
-sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
+    # Allow SSH and WireGuard port
+    ufw allow "$SSH_PORT/tcp" comment "SSH Port" >> "$LOG_FILE" 2>&1 || true
+    ufw allow "$WG_PORT/udp" comment "WireGuard VPN" >> "$LOG_FILE" 2>&1 || true
 
-# Smart NAT Control
-UFW_BEFORE="/etc/ufw/before.rules"
-WG_NAT_RULE="-A POSTROUTING -s 10.8.0.0/24 -o $NET_INTERFACE -j MASQUERADE"
+    # Allow routed forwarding specifically for WireGuard without opening global forwarding
+    ufw route allow in on wg0 out on "$NET_INTERFACE" >> "$LOG_FILE" 2>&1 || true
+    ufw route allow in on "$NET_INTERFACE" out on wg0 >> "$LOG_FILE" 2>&1 || true
 
-if grep -q "\*nat" "$UFW_BEFORE"; then
-    warn "Detected existing NAT rules!"
-    echo -e "1) PRESERVE existing rules (insert WireGuard rule in between)"
-    echo -e "2) DELETE existing NAT table (write only WireGuard rule)"
-        ask "Selection (1/2) [1]: " NAT_CHOICE "1"
-    
-    if [[ "$NAT_CHOICE" == "1" ]]; then
-        if ! grep -q "10.8.0.0/24" "$UFW_BEFORE"; then
-            if grep -q "^\*nat" "$UFW_BEFORE"; then
-                if ! grep -q "^:POSTROUTING " "$UFW_BEFORE"; then
-                    sed -i "/^\*nat/a :POSTROUTING ACCEPT [0:0]" "$UFW_BEFORE"
-                fi
-                sed -i "/^\*nat/,/^COMMIT/ { /^COMMIT/i $WG_NAT_RULE }" "$UFW_BEFORE"
+    # Enable UFW
+    ufw --force enable >> "$LOG_FILE" 2>&1 || true
+    success "Firewall (UFW) configured: SSH ($SSH_PORT/tcp) and WireGuard ($WG_PORT/udp) opened."
+}
+
+# --- 6. INITIAL SERVER INSTALLATION ---
+install_wireguard_server() {
+    echo -e "${YELLOW}Please configure installation settings (Press Enter for defaults):${NC}\n"
+
+    ask "WireGuard Port [41194]: " INPUT_WG "41194"
+    WG_PORT="${INPUT_WG:-41194}"
+
+    # DNS Selection
+    echo ""
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${YELLOW}Client DNS Configuration${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  1) Cloudflare  (1.1.1.1, 1.0.0.1)"
+    echo -e "  2) Google      (8.8.8.8, 8.8.4.4)"
+    echo -e "  3) AdGuard     (94.140.14.14, 94.140.15.15)"
+    echo -e "  4) Custom"
+    ask "Select DNS provider [1]: " DNS_CHOICE "1"
+
+    case "$DNS_CHOICE" in
+        1) CLIENT_DNS="1.1.1.1, 1.0.0.1" ;;
+        2) CLIENT_DNS="8.8.8.8, 8.8.4.4" ;;
+        3) CLIENT_DNS="94.140.14.14, 94.140.15.15" ;;
+        4)
+            ask "Primary DNS: " CUSTOM_DNS1 ""
+            ask "Secondary DNS: " CUSTOM_DNS2 ""
+            if [[ -z "$CUSTOM_DNS1" ]]; then
+                CLIENT_DNS="1.1.1.1, 1.0.0.1"
+            elif [[ -z "$CUSTOM_DNS2" ]]; then
+                CLIENT_DNS="$CUSTOM_DNS1"
             else
-                sed -i "1i*nat\n:POSTROUTING ACCEPT [0:0]\n$WG_NAT_RULE\nCOMMIT\n" "$UFW_BEFORE"
+                CLIENT_DNS="$CUSTOM_DNS1, $CUSTOM_DNS2"
             fi
+            ;;
+        *) CLIENT_DNS="1.1.1.1, 1.0.0.1" ;;
+    esac
+    log "Client DNS set to: $CLIENT_DNS"
+
+    ask "Enable automatic security updates? (y/n) [y]: " AUTO_UP "y"
+
+    # Install packages
+    install_packages
+
+    # Detect network and ports
+    detect_network
+    detect_ssh_port
+
+    # Security steps
+    configure_ssh
+    configure_fail2ban
+    configure_firewall
+
+    # Automated security updates
+    if [[ "$AUTO_UP" == "y" || "$AUTO_UP" == "Y" ]]; then
+        if command -v unattended-upgrade >/dev/null 2>&1; then
+            echo "unattended-upgrades unattended-upgrades/enable_auto_updates boolean true" | debconf-set-selections 2>/dev/null || true
+            dpkg-reconfigure -f noninteractive unattended-upgrades >> "$LOG_FILE" 2>&1 || true
+            success "Automatic security updates configured."
         fi
-    else
-        log "Cleaning old NAT table, backup: $UFW_BEFORE.bak"
-        cp "$UFW_BEFORE" "$UFW_BEFORE.bak"
-        sed -i '/\*nat/,/COMMIT/d' "$UFW_BEFORE"
-        sed -i "1i*nat\n:POSTROUTING ACCEPT [0:0]\n$WG_NAT_RULE\nCOMMIT\n" "$UFW_BEFORE"
     fi
-else
-    log "Creating new NAT table..."
-    sed -i "1i*nat\n:POSTROUTING ACCEPT [0:0]\n$WG_NAT_RULE\nCOMMIT\n" "$UFW_BEFORE"
-fi
 
-ufw --force enable >> "$LOG_FILE" 2>&1
+    # Generate Server Keys
+    mkdir -p "$WG_DIR" "$WG_CLIENTS_DIR"
+    chmod 700 "$WG_DIR"
+    local server_priv; server_priv=$(wg genkey)
+    local server_pub; server_pub=$(echo "$server_priv" | wg pubkey)
 
-# --- 7. SERVICE CONFIGURATION ---
-log "Writing server and client configurations..."
+    # Save server details
+    echo "$server_priv" > "$WG_DIR/server_private.key"
+    echo "$server_pub" > "$WG_DIR/server_public.key"
+    chmod 600 "$WG_DIR"/server_*.key
 
-# Server Config
-cat > $WG_DIR/wg0.conf <<EOF
+    # Save meta parameters for peer generation
+    cat > "$WG_DIR/params" <<EOF
+SERVER_PUB_IP="$SERVER_PUBLIC_IP"
+SERVER_PUB_KEY="$server_pub"
+SERVER_PORT="$WG_PORT"
+SERVER_NIC="$NET_INTERFACE"
+CLIENT_DNS="$CLIENT_DNS"
+EOF
+    chmod 600 "$WG_DIR/params"
+
+    # Write Server Configuration
+    # Uses clean in-interface iptables PostUp/PostDown to manage NAT forwarding
+    cat > "$WG_DIR/wg0.conf" <<EOF
 [Interface]
 Address = 10.8.0.1/24
 ListenPort = $WG_PORT
-PrivateKey = $SERVER_PRIV
-# IPTables rules added as additional security
-PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o $NET_INTERFACE -j MASQUERADE
-PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o $NET_INTERFACE -j MASQUERADE
+PrivateKey = $server_priv
+PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o $NET_INTERFACE -j MASQUERADE
+PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -m state --state RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -D POSTROUTING -s 10.8.0.0/24 -o $NET_INTERFACE -j MASQUERADE
 
+EOF
+    chmod 600 "$WG_DIR/wg0.conf"
+
+    # Enable and start WireGuard service
+    systemctl enable wg-quick@wg0 >> "$LOG_FILE" 2>&1 || true
+    systemctl restart wg-quick@wg0 >> "$LOG_FILE" 2>&1 || error "Failed to start WireGuard service."
+    success "WireGuard server service active on UDP port $WG_PORT."
+
+    # Add initial client
+    echo ""
+    log "Generating your first VPN client profile..."
+    add_client "client1"
+
+    # Installation summary
+    generate_summary
+}
+
+# --- 7. CLIENT MANAGEMENT FUNCTIONS ---
+add_client() {
+    local client_name="$1"
+    if [[ -z "$client_name" ]]; then
+        ask "Enter client name (letters/numbers only): " client_name "client2"
+    fi
+    client_name=$(echo "$client_name" | tr -dc 'a-zA-Z0-9_-')
+    [[ -z "$client_name" ]] && client_name="client_$(date +%s)"
+
+    if [[ -f "$WG_CLIENTS_DIR/$client_name.conf" ]]; then
+        warn "A client with name '$client_name' already exists!"
+        return 1
+    fi
+
+    # Read server parameters
+    if [[ -f "$WG_DIR/params" ]]; then
+        . "$WG_DIR/params"
+    else
+        error "Server params file not found ($WG_DIR/params)."
+    fi
+
+    # Find the next available IP address in 10.8.0.x
+    local next_ip=2
+    while grep -q "10\.8\.0\.$next_ip/" "$WG_DIR/wg0.conf" 2>/dev/null; do
+        next_ip=$((next_ip + 1))
+        if [[ $next_ip -gt 254 ]]; then
+            error "No more available IPs in the 10.8.0.0/24 subnet!"
+        fi
+    done
+    local client_ip="10.8.0.$next_ip"
+
+    # Generate client keys
+    local client_priv; client_priv=$(wg genkey)
+    local client_pub; client_pub=$(echo "$client_priv" | wg pubkey)
+
+    # Append peer to server config
+    cat >> "$WG_DIR/wg0.conf" <<EOF
+# Peer: $client_name
 [Peer]
-PublicKey = $CLIENT_PUB
-AllowedIPs = 10.8.0.2/32
+PublicKey = $client_pub
+AllowedIPs = $client_ip/32
+
 EOF
 
-# Client Config
-cat > $WG_DIR/client.conf <<EOF
+    # Apply live to wireguard interface without restarting
+    wg set wg0 peer "$client_pub" allowed-ips "$client_ip/32" 2>/dev/null || true
+
+    # Generate client configuration file
+    mkdir -p "$WG_CLIENTS_DIR"
+    local client_file="$WG_CLIENTS_DIR/$client_name.conf"
+    cat > "$client_file" <<EOF
 [Interface]
-PrivateKey = $CLIENT_PRIV
-Address = 10.8.0.2/24
+PrivateKey = $client_priv
+Address = $client_ip/24
 DNS = $CLIENT_DNS
 
 [Peer]
-PublicKey = $SERVER_PUB
-Endpoint = $SERVER_PUBLIC_IP:$WG_PORT
-AllowedIPs = 0.0.0.0/0
+PublicKey = $SERVER_PUB_KEY
+Endpoint = $SERVER_PUB_IP:$SERVER_PORT
+AllowedIPs = 0.0.0.0/0, ::/0
 PersistentKeepalive = 25
 EOF
+    chmod 600 "$client_file"
 
-chmod 600 $WG_DIR/*.conf
+    # Copy to user's home directory for easy retrieval
+    cp "$client_file" "$USER_HOME/$client_name.conf" 2>/dev/null || true
+    chown "$CURRENT_USER:$CURRENT_USER" "$USER_HOME/$client_name.conf" 2>/dev/null || true
 
-# --- 8. AUTOMATED SECURITY UPDATES AND FAIL2BAN CONFIGURATION ---
-if [[ "$AUTO_UP" == "y" ]]; then
-    log "Configuring automatic security updates..."
-    if command -v unattended-upgrade >/dev/null 2>&1; then
-        echo "unattended-upgrades unattended-upgrades/enable_auto_updates boolean true" | debconf-set-selections
-        dpkg-reconfigure -f noninteractive unattended-upgrades >> "$LOG_FILE" 2>&1
+    success "Client '$client_name' created successfully (IP: $client_ip)."
+    echo ""
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}QR CODE FOR MOBILE (${client_name})${NC}"
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    if command -v qrencode &>/dev/null; then
+        qrencode -t ansiutf8 < "$client_file"
     else
-        warn "unattended-upgrades package not installed, automatic updates could not be configured."
+        warn "qrencode not installed, QR code display skipped."
     fi
-fi
+    echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${GREEN}Configuration file saved at:${NC} $client_file"
+    echo -e "${GREEN}User copy saved at:${NC} $USER_HOME/$client_name.conf"
+    echo ""
+}
 
-# Fail2ban service check
-if systemctl is-enabled --quiet fail2ban 2>/dev/null; then
-    log "fail2ban already enabled"
-else
-    systemctl enable fail2ban >> "$LOG_FILE" 2>&1 || warn "fail2ban could not be enabled, may not be installed."
-fi
-
-# Restart fail2ban
-systemctl restart fail2ban >> "$LOG_FILE" 2>&1 || warn "fail2ban service could not be restarted"
-
-# Enable WireGuard service with validation
-if [[ -f "$WG_DIR/wg0.conf" ]]; then
-    if wg-quick strip wg0 > /dev/null 2>&1; then
-        if systemctl is-enabled --quiet wg-quick@wg0 2>/dev/null; then
-            log "wg-quick@wg0 already enabled"
-        else
-            systemctl enable wg-quick@wg0 >> "$LOG_FILE" 2>&1
-        fi
-        
-        log "Starting WireGuard service..."
-        if systemctl start wg-quick@wg0 2>> "$LOG_FILE"; then
-            log "WireGuard service started successfully"
-        else
-            warn "WireGuard service could not be started, check configuration."
-        fi
-    else
-        warn "WireGuard configuration could not be validated. Check wg0.conf file."
+list_clients() {
+    echo -e "\n${CYAN}════════════════════════════════════════${NC}"
+    echo -e "${BOLD}          CONFIGURED CLIENTS            ${NC}"
+    echo -e "${CYAN}════════════════════════════════════════${NC}"
+    if [[ ! -d "$WG_CLIENTS_DIR" ]] || [[ -z "$(ls -A "$WG_CLIENTS_DIR" 2>/dev/null)" ]]; then
+        echo -e "${YELLOW}No client profiles found in $WG_CLIENTS_DIR.${NC}"
+        return
     fi
-else
-    warn "$WG_DIR/wg0.conf file not found."
-fi
 
-# --- 9. GENERATING INSTALLATION SUMMARY ---
-USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
-[[ -z "$USER_HOME" || "$USER_HOME" == "/root" ]] && USER_HOME="/root"
-NOTES_FILE="$USER_HOME/installation_notes.txt"
+    printf "%-20s %-15s %-25s\n" "CLIENT NAME" "IP ADDRESS" "CONFIG PATH"
+    echo "------------------------------------------------------------"
+    for f in "$WG_CLIENTS_DIR"/*.conf; do
+        [[ -e "$f" ]] || continue
+        local cname; cname=$(basename "$f" .conf)
+        local cip; cip=$(grep -m1 '^Address' "$f" | awk '{print $3}')
+        printf "%-20s %-15s %-25s\n" "$cname" "$cip" "$f"
+    done
+    echo ""
+}
 
-cat > "$NOTES_FILE" <<EOF
+revoke_client() {
+    local client_to_remove="$1"
+    if [[ -z "$client_to_remove" ]]; then
+        list_clients
+        ask "Enter the name of the client to revoke: " client_to_remove ""
+    fi
+    if [[ -z "$client_to_remove" || ! -f "$WG_CLIENTS_DIR/$client_to_remove.conf" ]]; then
+        warn "Client '$client_to_remove' not found."
+        return 1
+    fi
+
+    # Read client's public key from private key
+    local c_priv; c_priv=$(grep -m1 '^PrivateKey' "$WG_CLIENTS_DIR/$client_to_remove.conf" | awk '{print $3}')
+    local c_pub; c_pub=$(echo "$c_priv" | wg pubkey 2>/dev/null)
+
+    # Remove peer dynamically from WireGuard
+    if [[ -n "$c_pub" ]]; then
+        wg set wg0 peer "$c_pub" remove 2>/dev/null || true
+    fi
+
+    # Remove from wg0.conf
+    # Removes the comment line and the [Peer] block
+    sed -i "/# Peer: $client_to_remove/,+4d" "$WG_DIR/wg0.conf" 2>/dev/null || true
+
+    # Remove config file
+    rm -f "$WG_CLIENTS_DIR/$client_to_remove.conf"
+    rm -f "$USER_HOME/$client_to_remove.conf"
+
+    success "Client '$client_to_remove' has been completely revoked."
+}
+
+# --- 8. SUMMARY REPORT ---
+generate_summary() {
+    local notes_file="$USER_HOME/installation_notes.txt"
+    cat > "$notes_file" <<EOF
 ==================================================
 WIREGUARD & SSH INSTALLATION REPORT ($(date))
 ==================================================
 
-[SSH INFORMATION]
-Port: 22
-Command: ssh ${CURRENT_USER}@$SERVER_PUBLIC_IP
-Root Login: $PERMIT_ROOT
+[SSH HARDENING]
+Port: $SSH_PORT
+Command: ssh ${CURRENT_USER}@$SERVER_PUBLIC_IP -p $SSH_PORT
+Root Login: $permit_root
 
-[WIREGUARD INFORMATION]
-Port: $WG_PORT
-Server IP: $SERVER_PUBLIC_IP
-Internal IP Range: 10.8.0.0/24
+[WIREGUARD GATEWAY]
+Port: $WG_PORT (UDP)
+Server Public IP: $SERVER_PUBLIC_IP
+Subnet: 10.8.0.0/24
+Clients Directory: $WG_CLIENTS_DIR
 
-[CLIENT CONFIGURATION FILE]
---------------------------------------------------
-$(cat $WG_DIR/client.conf)
---------------------------------------------------
+[CLIENT PROFILES]
+Initial client configuration saved to:
+- $WG_CLIENTS_DIR/client1.conf
+- $USER_HOME/client1.conf
 
+[MANAGEMENT]
+To add, list or revoke clients at any time, run:
+  sudo bash install.sh
 ==================================================
 EOF
+    chown "$CURRENT_USER:$CURRENT_USER" "$notes_file" 2>/dev/null || true
+    success "Installation report saved to: $notes_file"
+}
 
-chown "$SUDO_USER:$SUDO_USER" "$NOTES_FILE" 2>/dev/null || true
+# --- 9. INTERACTIVE MENU (WHEN ALREADY INSTALLED) ---
+manage_menu() {
+    echo -e "${CYAN}====================================================${NC}"
+    echo -e "   ${BOLD}WIREGUARD GATEWAY MANAGEMENT PANEL${NC}"
+    echo -e "${CYAN}====================================================${NC}"
+    echo -e "WireGuard is already installed and running on this server."
+    echo ""
+    echo -e "  1) ${GREEN}Add a new client profile (QR Code)${NC}"
+    echo -e "  2) ${BLUE}List existing clients${NC}"
+    echo -e "  3) ${YELLOW}Show QR Code / config for an existing client${NC}"
+    echo -e "  4) ${RED}Revoke / delete a client${NC}"
+    echo -e "  5) Check WireGuard status & traffic (wg show)${NC}"
+    echo -e "  6) Reinstall / Reconfigure from scratch${NC}"
+    echo -e "  7) Exit"
+    echo ""
+    ask "Select an option [1-7]: " MENU_CHOICE "1"
 
-echo -e "\n${GREEN}========================================${NC}"
-success "Installation completed successfully!"
-warn "Notes saved: $NOTES_FILE"
-echo -e "\n${BLUE}--- CLIENT QR CODE ---${NC}"
-if command -v qrencode &>/dev/null; then
-    qrencode -t ansiutf8 < $WG_DIR/client.conf
-else
-    warn "qrencode not installed, QR code skipped."
+    case "$MENU_CHOICE" in
+        1)
+            add_client ""
+            ;;
+        2)
+            list_clients
+            ;;
+        3)
+            list_clients
+            ask "Enter client name to display: " SHOW_NAME ""
+            if [[ -f "$WG_CLIENTS_DIR/$SHOW_NAME.conf" ]]; then
+                echo -e "\n${BLUE}--- QR CODE ($SHOW_NAME) ---${NC}"
+                qrencode -t ansiutf8 < "$WG_CLIENTS_DIR/$SHOW_NAME.conf"
+                echo -e "\n${GREEN}--- CONFIG FILE ($SHOW_NAME) ---${NC}"
+                cat "$WG_CLIENTS_DIR/$SHOW_NAME.conf"
+            else
+                warn "Client '$SHOW_NAME' not found."
+            fi
+            ;;
+        4)
+            revoke_client
+            ;;
+        5)
+            echo -e "\n${CYAN}--- WIREguard LIVE STATUS ---${NC}"
+            wg show
+            echo ""
+            ;;
+        6)
+            warn "Reinstalling will overwrite existing configurations!"
+            ask "Are you sure you want to proceed? (y/n) [n]: " CONFIRM_REINSTALL "n"
+            if [[ "$CONFIRM_REINSTALL" == "y" || "$CONFIRM_REINSTALL" == "Y" ]]; then
+                systemctl stop wg-quick@wg0 2>/dev/null || true
+                install_wireguard_server
+            else
+                log "Reinstall cancelled."
+            fi
+            ;;
+        7)
+            exit 0
+            ;;
+        *)
+            warn "Invalid choice."
+            ;;
+    esac
+}
+
+# --- MAIN EXECUTION ---
+echo -e "${CYAN}====================================================${NC}"
+echo -e "   ${BOLD}WIREGUARD GATEWAY & SSH SECURITY HARDENING${NC}"
+echo -e "${CYAN}====================================================${NC}"
+
+check_prerequisites
+get_user_info
+
+# Non-interactive CLI flag support
+if [[ "$1" == "--add-client" ]]; then
+    add_client "$2"
+    exit 0
+elif [[ "$1" == "--revoke-client" ]]; then
+    revoke_client "$2"
+    exit 0
+elif [[ "$1" == "--list" ]]; then
+    list_clients
+    exit 0
+elif [[ "$1" == "--status" ]]; then
+    wg show
+    exit 0
 fi
-echo -e "${BLUE}----------------------${NC}\n"
 
-echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${YELLOW}CLIENT CONFIGURATION${NC}"
-echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-cat $WG_DIR/client.conf
-echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo ""
-echo -e "${YELLOW}⚠️  Save this output! You'll need it for the client/gateway setup.${NC}"
-echo -e "${GREEN}📁 File location:${NC} $WG_DIR/client.conf"
-echo ""
-
-# Disable error trap before final output
-trap - ERR
-
-ask "Reboot system now? (y/n) [n]: " REBOOT_FINAL "n"
-
-if [[ "$REBOOT_FINAL" == "y" || "$REBOOT_FINAL" == "Y" ]]; then
-    log "Rebooting system..."
-    sleep 2
-    reboot
+# Check if already installed
+if [[ -f "$WG_DIR/wg0.conf" ]] && systemctl is-active --quiet wg-quick@wg0; then
+    manage_menu
 else
-    success "Setup complete!"
+    install_wireguard_server
 fi
